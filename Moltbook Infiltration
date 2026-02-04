@@ -1,0 +1,297 @@
+# Moltbook PowerShell CLI
+# Basic interaction: register, browse posts, create posts & comments
+# ===== Configuration =====
+$baseUrl = "https://www.moltbook.com/api/v1"
+$credentialsFile = "$env:USERPROFILE\.moltbook\credentials.json"
+
+function Save-Credentials {
+    param($agent)
+    $creds = @{
+        apiKey     = $agent.api_key
+        agentName  = $agent.name
+        agentId    = $agent.id
+        profileUrl = $agent.profile_url
+    }
+    $dir = Split-Path $credentialsFile
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $creds | ConvertTo-Json | Set-Content -Path $credentialsFile -Force
+    Write-Host "✅ Credentials saved to $credentialsFile"
+    Write-Host "Claim URL: $($agent.claim_url)"
+}
+
+function Load-Credentials {
+    if (-not (Test-Path $credentialsFile)) {
+        Write-Warning "No saved credentials found. Please register first."
+        return $null
+    }
+    return Get-Content $credentialsFile | ConvertFrom-Json
+}
+
+function Register-Agent {
+    Write-Host "=== Register Moltbook Agent ==="
+    $agentName   = Read-Host "Agent Name"
+    $description = Read-Host "Description"
+    $body = @{
+        name        = $agentName
+        description = $description
+    } | ConvertTo-Json
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri "$baseUrl/agents/register" -Body $body -ContentType "application/json"
+    } catch {
+        Write-Error "Registration failed: $($_.Exception.Message)"
+        return
+    }
+    if ($resp.success -eq $true -and $resp.agent) {
+        Write-Host "🎉 Registration successful!"
+        Save-Credentials -agent $resp.agent
+        Write-Host "Please visit the claim URL to verify your agent."
+    } else {
+        Write-Warning "Unexpected API response: $($resp | ConvertTo-Json -Depth 5)"
+    }
+}
+
+function Get-Post {
+    param([string]$PostID = "")
+    if ([string]::IsNullOrEmpty($PostID)) { $PostID = Read-Host "Post ID" }
+    if ([string]::IsNullOrEmpty($PostID)) { return }
+
+    $uri = "https://www.moltbook.com/api/v1/posts/$PostID"
+
+    try {
+        # Try public first (many posts are readable without auth)
+        $post = Invoke-RestMethod -Method Get -Uri $uri
+        Write-Host "Fetched post publicly (no auth needed)."
+    }
+    catch {
+        # Fallback to authenticated
+        $creds = Load-Credentials
+        if (-not $creds) { return }
+        $headers = @{
+            "Authorization" = "Bearer $($creds.apiKey)"
+            "Accept"        = "application/json"
+        }
+        try {
+            $post = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+            Write-Host "Fetched post with authenticated key."
+        }
+        catch {
+            Write-Error "Failed to fetch post ${PostID}: $($_.Exception.Message)"
+            if ($_.Exception.Response.StatusCode -eq 429) {
+                Write-Host "Rate limit hit — wait a minute and try again."
+            }
+            return
+        }
+    }
+
+    Write-Host "=== Post: $($post.id) ==="
+    $authorName = $post.author?.name ?? $post.agent?.name ?? "Unknown"
+    Write-Host "Author: $authorName"
+    if ($post.title) { Write-Host "Title: $($post.title)" }
+    Write-Host $post.content
+    Write-Host "↑ $($post.upvotes ?? 0) | ↓ $($post.downvotes ?? 0) | 💬 $($post.comment_count ?? 0) | $($post.created_at ?? 'Unknown')"
+    Write-Host "-----------------------------"
+
+    if ($post.comments -and $post.comments.Count -gt 0) {
+        Write-Host "Comments:"
+        foreach ($c in $post.comments) {
+            $cAuthor = $c.author?.name ?? $c.agent?.name ?? "Unknown"
+            Write-Host "  [$($c.id)] $cAuthor : $($c.content)"
+        }
+    } else {
+        Write-Host "(No comments found or not included)"
+    }
+}
+
+function Browse-Posts {
+    $uri = "https://www.moltbook.com/api/v1/posts?sort=new&limit=20"
+
+    try {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri
+        $posts = $resp.posts ?? $resp
+        Write-Host "Fetched $($posts.Count) global posts (public view, sorted by new)."
+    }
+    catch {
+        Write-Error "Failed to fetch global posts: $($_.Exception.Message)"
+        return
+    }
+
+    if ($null -eq $posts -or $posts.Count -eq 0) {
+        Write-Host "No posts found."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "=== Moltbook Global Posts ==="
+    Write-Host ""
+    foreach ($post in $posts) {
+        $title  = if ($post.title) { $post.title } else { "(no title)" }
+        $author = $post.author?.name ?? $post.agent?.name ?? "Unknown"
+        $preview = $post.content.Substring(0, [Math]::Min(250, $post.content.Length))
+        if ($post.content.Length -gt 250) { $preview += "..." }
+        Write-Host "[$($post.id)] $author — $title"
+        Write-Host $preview
+        Write-Host "↑ $($post.upvotes ?? 0) | ↓ $($post.downvotes ?? 0) | 💬 $($post.comment_count ?? 0)"
+        Write-Host "-----------------------------"
+    }
+}
+
+function Create-Post {
+    $creds = Load-Credentials
+    if (-not $creds) { return }
+
+    $submolt = Read-Host "Submolt (community) to post in (e.g. general, agents, blesstheirhearts)"
+    $title   = Read-Host "Post Title"
+    $content = Read-Host "Post Content (body text)"
+
+    if ([string]::IsNullOrWhiteSpace($submolt) -or [string]::IsNullOrWhiteSpace($title)) {
+        Write-Warning "Submolt and Title are required. Aborting."
+        return
+    }
+
+    $body = @{
+        submolt  = $submolt.Trim()
+        title    = $title.Trim()
+        content  = $content.Trim()
+    } | ConvertTo-Json
+
+    $headers = @{
+        Authorization  = "Bearer $($creds.apiKey)"
+        "Content-Type" = "application/json"
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri "$baseUrl/posts" -Body $body -Headers $headers
+        if ($resp.success -eq $true) {
+            Write-Host "✅ Post published successfully!"
+            if ($resp.data?.id) {
+                Write-Host "New Post ID: $($resp.data.id)"
+                Write-Host "View: https://www.moltbook.com/post/$($resp.data.id)"
+            }
+        } else {
+            Write-Warning "API error: $($resp.error ?? 'Unknown')"
+            if ($resp.hint) { Write-Host "Hint: $($resp.hint)" }
+        }
+    }
+    catch {
+        Write-Error "Failed to create post: $($_.Exception.Message)"
+        if ($_.Exception.Response.StatusCode -eq 429) {
+            Write-Host "Rate limit hit (1 post / 30 min) — try again later."
+        }
+    }
+}
+
+function Comment-Post {
+    $creds = Load-Credentials
+    if (-not $creds) { return }
+
+    $postId      = Read-Host "Post ID to comment on"
+    $commentText = Read-Host "Comment text"
+
+    if ([string]::IsNullOrWhiteSpace($commentText)) {
+        Write-Warning "Comment text cannot be empty."
+        return
+    }
+
+    $body = @{ content = $commentText.Trim() } | ConvertTo-Json
+
+    $headers = @{
+        Authorization  = "Bearer $($creds.apiKey)"
+        "Content-Type" = "application/json"
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri "$baseUrl/posts/$postId/comments" -Body $body -Headers $headers
+        if ($resp.success -eq $true) {
+            Write-Host "✅ Comment submitted successfully!"
+            if ($resp.comment?.id) {
+                Write-Host "New comment ID: $($resp.comment.id)"
+            }
+        } else {
+            Write-Warning "API returned success=false: $($resp.error ?? 'Unknown error')"
+        }
+    }
+    catch {
+        Write-Error "Failed to submit comment on post ${postId}: $($_.Exception.Message)"
+        if ($_.Exception.Response.StatusCode -eq 429) {
+            Write-Host "Rate limit hit (1 comment / 20 sec) — wait a moment."
+        }
+    }
+}
+
+function Browse-Submolt {
+    param([string]$SubmoltName = "")
+
+    if ([string]::IsNullOrWhiteSpace($SubmoltName)) {
+        $SubmoltName = Read-Host "Submolt Name (e.g. blesstheirhearts, general, agents)"
+    }
+    $SubmoltName = $SubmoltName.Trim().ToLowerInvariant()
+
+    $uri = "https://www.moltbook.com/api/v1/posts?submolt=$SubmoltName&sort=new&limit=20"
+
+    try {
+        $resp = Invoke-RestMethod -Method Get -Uri $uri
+        $posts = $resp.posts ?? $resp
+        Write-Host "Fetched $($posts.Count) posts from submolt '$SubmoltName' (public view, sorted by new)."
+        if ($resp.has_more) {
+            Write-Host "More posts available (next_offset: $($resp.next_offset ?? 'unknown'))"
+        }
+    }
+    catch {
+        Write-Error "Failed to fetch submolt '$SubmoltName': $($_.Exception.Message)"
+        return
+    }
+
+    if ($null -eq $posts -or $posts.Count -eq 0) {
+        Write-Host "No posts found in '$SubmoltName' (try sort=hot or check spelling)."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "=== Submolt: $SubmoltName ==="
+    Write-Host ""
+    foreach ($post in $posts) {
+        $title  = if ($post.title) { $post.title } else { "(no title)" }
+        $author = $post.author?.name ?? $post.agent?.name ?? "Unknown"
+        $preview = $post.content.Substring(0, [Math]::Min(250, $post.content.Length))
+        if ($post.content.Length -gt 250) { $preview += "..." }
+        Write-Host "[$($post.id)] $author — $title"
+        Write-Host $preview
+        Write-Host "↑ $($post.upvotes ?? 0) | ↓ $($post.downvotes ?? 0) | 💬 $($post.comment_count ?? 0) | $($post.created_at ?? 'Unknown')"
+        Write-Host "-----------------------------"
+    }
+}
+
+function Run-Command {
+    $host.EnterNestedPrompt()
+}
+
+function Main-Menu {
+    Clear-Host
+    Write-Host "=== Moltbook PowerShell 🦞 ==="
+    Write-Host "1) Register agent"
+    Write-Host "2) Create post"
+    Write-Host "3) Get post"
+    Write-Host "4) Comment on post"
+    Write-Host "5) Browse Submolt"
+    Write-Host "6) Browse Global Posts"
+    Write-Host "7) Run Command (debug)"
+    Write-Host "0) Exit"
+    Write-Host ""
+}
+
+do {
+    Main-Menu
+    $choice = Read-Host "Select an option"
+    switch ($choice) {
+        '1' { Register-Agent }
+        '2' { Create-Post }
+        '3' { Get-Post }
+        '4' { Comment-Post }
+        '5' { Browse-Submolt }
+        '6' { Browse-Posts }
+        '7' { Run-Command }
+        '0' { Write-Host "Goodbye! 🦞" }
+        default { Write-Warning "Invalid choice." }
+    }
+    if ($choice -ne '0') { Read-Host "Press Enter to continue..." }
+} while ($choice -ne '0')
